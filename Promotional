@@ -1,0 +1,272 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { AppStep, AdCampaign, GeneratedImage, ImagePromptRequest, GenerationModel, ScenarioTemplate, Source } from './types';
+import { analyzeImageAndCreateCampaign, generateImageFromPrompt, researchBrand, generateScenarioTemplates } from './services/geminiService';
+import { ImageUpload } from './components/ImageUpload';
+import { ContestSelection } from './components/ContestSelection'; // New Component
+import { ScenarioDisplay } from './components/ScenarioDisplay';
+import { GenerationGrid } from './components/GenerationGrid';
+import { CharacterBuilder } from './components/CharacterBuilder';
+import { ModelSelector } from './components/ModelSelector';
+import { ScenarioSelector } from './components/ScenarioSelector';
+import { Loader } from './components/ui/Loader';
+
+const App: React.FC = () => {
+  const [step, setStep] = useState<AppStep>(AppStep.CONTEST_SELECTION);
+  
+  // Data States
+  const [contestContext, setContestContext] = useState<string>('');
+  const [researchData, setResearchData] = useState<{ text: string, sources: Source[] } | undefined>(undefined);
+  const [scenarioTemplates, setScenarioTemplates] = useState<ScenarioTemplate[]>([]);
+  const [selectedTemplate, setSelectedTemplate] = useState<ScenarioTemplate | undefined>(undefined);
+  
+  const [refImages, setRefImages] = useState<string[]>([]);
+  const [campaign, setCampaign] = useState<AdCampaign | null>(null);
+  
+  const [modelType, setModelType] = useState<GenerationModel>('nano-banana');
+  const [finalCharacterImage, setFinalCharacterImage] = useState<string | null>(null);
+
+  const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loadingMessage, setLoadingMessage] = useState("로딩 중...");
+
+  const isGeneratingRef = useRef(false);
+
+  // 1. Contest Selected (Step 1 -> 2)
+  const handleContestSelected = async (contestInfo: string) => {
+    setContestContext(contestInfo);
+    setStep(AppStep.ANALYZING_BRAND);
+    setLoadingMessage("공모전 주제 분석 및 5가지 시나리오 스타일 설계 중...");
+    setError(null);
+
+    try {
+        // Research background info
+        const rData = await researchBrand(contestInfo);
+        setResearchData(rData);
+
+        // Generate 5 distinct templates based on contest info
+        const templates = await generateScenarioTemplates(contestInfo, rData.text);
+        setScenarioTemplates(templates);
+
+        setStep(AppStep.SCENARIO_SELECTION);
+    } catch (err) {
+        console.error(err);
+        setError("분석 중 오류가 발생했습니다. 다시 시도해주세요.");
+        setStep(AppStep.CONTEST_SELECTION);
+    }
+  };
+
+  // 2. Template Selected (Step 2 -> 3)
+  const handleTemplateSelected = (template: ScenarioTemplate) => {
+      setSelectedTemplate(template);
+      setStep(AppStep.IMAGE_UPLOAD);
+  };
+
+  // 3. Images Uploaded (Step 3 -> 4)
+  const handleImageSelected = async (base64s: string[]) => {
+      setRefImages(base64s);
+      setStep(AppStep.ANALYZING_CAMPAIGN);
+      setLoadingMessage(`'${selectedTemplate?.title}' 컨셉과 레퍼런스 이미지를 융합하여 상세 기획 중...`);
+
+      try {
+        const result = await analyzeImageAndCreateCampaign(base64s, researchData, selectedTemplate);
+        setCampaign(result);
+        setStep(AppStep.SCENARIO_REVIEW);
+      } catch (err) {
+        console.error(err);
+        setError("캠페인 생성 실패. 다시 시도해주세요.");
+        setStep(AppStep.IMAGE_UPLOAD);
+      }
+  };
+
+  // 4. Scenario Confirmed -> Go to Model Selection
+  const handleScenarioConfirmed = () => {
+      setStep(AppStep.MODEL_SELECTION);
+  };
+
+  // 5. Model Selected -> Go to Character Builder
+  const handleModelSelected = (selectedModel: GenerationModel) => {
+      setModelType(selectedModel);
+      setStep(AppStep.CHARACTER_BUILDER);
+  };
+
+  // 6. Character Confirmed -> Start Asset Generation
+  const handleCharacterConfirmed = (charImage: string) => {
+      setFinalCharacterImage(charImage);
+      startGeneration(charImage);
+  };
+
+  // 7. Start Generation Loop
+  const startGeneration = (characterRef: string) => {
+    if (!campaign) return;
+
+    // Initialize grid
+    const initialImages: GeneratedImage[] = campaign.imagePrompts.map(p => ({
+      id: p.id,
+      prompt: p.description,
+      technicalPrompt: p.technicalPrompt,
+      status: 'pending'
+    }));
+    setGeneratedImages(initialImages);
+    setStep(AppStep.GENERATING_ASSETS);
+    
+    isGeneratingRef.current = true;
+    processQueue(initialImages, 0, characterRef);
+  };
+
+  const processQueue = async (images: GeneratedImage[], index: number, referenceImage: string) => {
+    if (!isGeneratingRef.current) return;
+    if (index >= images.length) {
+      isGeneratingRef.current = false;
+      return;
+    }
+
+    const currentImg = images[index];
+    if (currentImg.status === 'completed') {
+        processQueue(images, index + 1, referenceImage);
+        return;
+    }
+
+    setGeneratedImages(prev => prev.map(img => 
+      img.id === currentImg.id ? { ...img, status: 'generating' } : img
+    ));
+
+    try {
+      const result = await generateImageFromPrompt(currentImg.technicalPrompt, referenceImage, modelType);
+      
+      setGeneratedImages(prev => prev.map(img => 
+        img.id === currentImg.id ? { ...img, status: 'completed', imageUrl: result.imageUrl, resolution: result.resolution } : img
+      ));
+    } catch (err) {
+      console.error(`Failed to generate image ${currentImg.id}`, err);
+      setGeneratedImages(prev => prev.map(img => 
+        img.id === currentImg.id ? { ...img, status: 'failed' } : img
+      ));
+    } finally {
+      setTimeout(() => {
+        processQueue(images, index + 1, referenceImage);
+      }, 500); 
+    }
+  };
+
+  // Regeneration Handler
+  const handleRegenerate = async (id: number) => {
+      if (!finalCharacterImage) return;
+
+      setGeneratedImages(prev => prev.map(img => 
+        img.id === id ? { ...img, status: 'generating', imageUrl: undefined } : img
+      ));
+
+      const targetImg = generatedImages.find(i => i.id === id);
+      if (!targetImg) return;
+
+      try {
+        const result = await generateImageFromPrompt(targetImg.technicalPrompt, finalCharacterImage, modelType);
+        
+        setGeneratedImages(prev => prev.map(img => 
+            img.id === id ? { ...img, status: 'completed', imageUrl: result.imageUrl, resolution: result.resolution } : img
+        ));
+      } catch (err) {
+        console.error("Regeneration failed", err);
+        setGeneratedImages(prev => prev.map(img => 
+            img.id === id ? { ...img, status: 'failed' } : img
+        ));
+      }
+  };
+
+  const completedCount = generatedImages.filter(i => i.status === 'completed').length;
+
+  return (
+    <div className="min-h-screen bg-secondary text-textMain selection:bg-primary/20 selection:text-primary">
+      {/* Header */}
+      <header className="fixed top-0 left-0 right-0 z-40 bg-white/70 backdrop-blur-xl border-b border-white/20 shadow-sm h-20 flex items-center justify-between px-6 lg:px-12 transition-all">
+        <div className="flex items-center gap-3 cursor-pointer" onClick={() => window.location.reload()}>
+           <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-pastelBlue to-primary flex items-center justify-center text-xl shadow-lg shadow-primary/20 text-white">
+             🍌
+           </div>
+           <div className="flex flex-col">
+             <span className="text-[10px] font-bold text-primary tracking-widest uppercase mb-0.5">AI 감독 유양석</span>
+             <h1 className="text-lg font-bold tracking-tight text-textMain leading-none">
+               홍보, 광고영상 나노바나나 프로 빌더앱
+             </h1>
+           </div>
+        </div>
+        <div className="text-xs font-medium text-textSub hidden sm:block bg-slate-100 px-3 py-1.5 rounded-full">
+          Powered by Google Gemini 3 Pro
+        </div>
+      </header>
+
+      <main className="pt-32 px-6 lg:px-12 pb-12 max-w-[1600px] mx-auto">
+        {error && (
+          <div className="max-w-xl mx-auto mb-8 bg-red-50 border border-red-100 text-red-600 px-4 py-3 rounded-2xl flex items-center gap-3 shadow-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            {error}
+          </div>
+        )}
+
+        {/* 1. Contest Selection */}
+        {step === AppStep.CONTEST_SELECTION && (
+            <ContestSelection onContestSelected={handleContestSelected} />
+        )}
+
+        {/* Loading Views */}
+        {(step === AppStep.ANALYZING_BRAND || step === AppStep.ANALYZING_CAMPAIGN) && (
+          <div className="flex flex-col items-center justify-center min-h-[50vh] animate-fade-in">
+            <Loader size="lg" color="border-primary" />
+            <h3 className="mt-8 text-2xl font-bold text-textMain">{loadingMessage}</h3>
+            <p className="mt-2 text-textSub">Gemini 3 Pro가 Creative Director 역할을 수행하고 있습니다.</p>
+          </div>
+        )}
+
+        {/* 2. Scenario Selection */}
+        {step === AppStep.SCENARIO_SELECTION && (
+            <ScenarioSelector 
+                templates={scenarioTemplates} 
+                onSelect={handleTemplateSelected} 
+            />
+        )}
+
+        {/* 3. Image Upload (Now comes AFTER style selection) */}
+        {step === AppStep.IMAGE_UPLOAD && (
+            <ImageUpload 
+                onImageSelected={handleImageSelected} 
+                selectedTemplate={selectedTemplate}
+            />
+        )}
+
+        {/* 4. Scenario Review */}
+        {step === AppStep.SCENARIO_REVIEW && campaign && (
+          <ScenarioDisplay campaign={campaign} onConfirm={handleScenarioConfirmed} />
+        )}
+
+        {/* 5. Model Selection */}
+        {step === AppStep.MODEL_SELECTION && (
+            <ModelSelector onSelect={handleModelSelected} />
+        )}
+
+        {/* 6. Character Builder */}
+        {step === AppStep.CHARACTER_BUILDER && campaign && (
+            <CharacterBuilder 
+                visualStrategy={campaign.visualStrategy} 
+                modelType={modelType}
+                onCharacterConfirmed={handleCharacterConfirmed} 
+            />
+        )}
+
+        {/* 7. Generation Grid */}
+        {step === AppStep.GENERATING_ASSETS && (
+          <div className="animate-fade-in">
+             <GenerationGrid 
+                images={generatedImages} 
+                completedCount={completedCount} 
+                onRegenerate={handleRegenerate}
+            />
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;
